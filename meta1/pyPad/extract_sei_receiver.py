@@ -120,7 +120,8 @@ def main():
     matroskademux name=demux demux.video_0 !
     h264parse config-interval=-1 name=hp ! video/x-h264,stream-format=byte-stream,alignment=au !
     tee name=t !
-    queue ! mp4mux faststart=true ! filesink location={outfile} sync=false
+    queue ! h264parse config-interval=1 ! video/x-h264,stream-format=avc,alignment=au !
+    mp4mux faststart=true ! filesink location={outfile} sync=false
     t. ! fakesink sync=false
     """
     pipeline = Gst.parse_launch(pipe_str)

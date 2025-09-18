@@ -69,9 +69,13 @@ class SeiInjector:
         # stitch: new = [sei][orig]
         orig_sz = buf.get_size()
         new_buf = Gst.Buffer.new_allocate(None, len(sei) + orig_sz, None)
-        # copy timing/flags/meta
-        new_buf.copy_into(buf, Gst.BufferCopyFlags.FLAGS | Gst.BufferCopyFlags.TIMESTAMPS | Gst.BufferCopyFlags.META, 0, -1)
-
+        #  don't copy DATA, and size=0
+        new_buf.copy_into(
+            buf,
+            Gst.BufferCopyFlags.FLAGS | Gst.BufferCopyFlags.TIMESTAMPS | Gst.BufferCopyFlags.META,
+            0,
+            0
+        )
         # write bytes
         success, mapinfo = new_buf.map(Gst.MapFlags.WRITE)
         if not success:
@@ -108,9 +112,11 @@ def main():
     decodebin ! videoconvert !
     x264enc tune=zerolatency speed-preset=ultrafast bitrate=2000 key-int-max=30 !
     h264parse config-interval=-1 name=hp ! video/x-h264,stream-format=byte-stream,alignment=au !
+    h264parse config-interval=1 ! video/x-h264,stream-format=avc,alignment=au !
     matroskamux streamable=true !
     tcpclientsink host={host} port={port}
     """
+
     pipeline = Gst.parse_launch(pipe_str)
     h264parse = pipeline.get_by_name("hp")
     injector = SeiInjector(uuid_str, meta, every_n=0)  # set every_n>0 to inject regularly
