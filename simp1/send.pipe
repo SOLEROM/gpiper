@@ -1,0 +1,5 @@
+gst-launch-1.0 -v \
+  filesrc location=../demo/test2sec.avi ! decodebin ! videoconvert ! \
+  x264enc tune=zerolatency speed-preset=ultrafast bitrate=2000 key-int-max=30 ! \
+  h264parse config-interval=1 ! rtph264pay pt=96 ! \
+  udpsink host=127.0.0.1 port=5000

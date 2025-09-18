@@ -1,0 +1,6 @@
+gst-launch-1.0 -v \
+  filesrc location=../demo/test2sec.mp4 ! \
+  qtdemux name=demux demux.video_0 ! queue ! \
+  h264parse ! \
+  rtph264pay config-interval=1 pt=96 ! \
+  udpsink host=127.0.0.1 port=5000
