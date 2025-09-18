@@ -1,0 +1,3 @@
+gst-launch-1.0 -e -v \
+  tcpclientsrc host=127.0.0.1 port=5000 ! tsdemux ! h264parse ! \
+  matroskamux ! filesink location=../out/received.mkv

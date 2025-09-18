@@ -1,0 +1,5 @@
+gst-launch-1.0 -e -v \
+  filesrc location=../demo/test2sec.mp4 ! decodebin ! videoconvert ! \
+  x264enc tune=zerolatency speed-preset=ultrafast bitrate=2000 key-int-max=30 ! \
+  h264parse config-interval=1 ! mpegtsmux ! \
+  tcpserversink host=0.0.0.0 port=5000
