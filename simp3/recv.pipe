@@ -1,3 +1,5 @@
 gst-launch-1.0 -e -v \
-  tcpclientsrc host=127.0.0.1 port=5000 ! tsdemux ! h264parse ! \
-  matroskamux ! filesink location=../out/received.mkv
+  tcpserversrc host=0.0.0.0 port=5000 ! \
+  matroskademux name=demux demux.video_0 ! queue ! \
+  h264parse ! mp4mux faststart=true ! \
+  filesink location=../out/received.mp4
