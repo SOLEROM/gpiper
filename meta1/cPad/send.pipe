@@ -2,6 +2,6 @@ gst-launch-1.0 -e -v \
   filesrc location=../demo/test2sec.avi ! \
   decodebin ! videoconvert ! \
   x264enc tune=zerolatency speed-preset=ultrafast bitrate=2000 key-int-max=30 ! \
-  h264parse ! \
+  h264parse config-interval=-1 alignment=au stream-format=byte-stream ! \
   matroskamux streamable=true ! \
   tcpclientsink host=127.0.0.1 port=5000
