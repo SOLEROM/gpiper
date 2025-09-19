@@ -1,52 +1,44 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 import sys, json, uuid as uuidlib
+import gi
+gi.require_version('Gst', '1.0')
 from gi.repository import Gst, GObject
 
 Gst.init(None)
 
-# ---------- minimal H.264 SEI builder (user_data_unregistered) ----------
+# ── H.264 SEI (user_data_unregistered) builder ────────────────────────────────
 def _emulation_prevention(data: bytes) -> bytes:
-    out = bytearray()
-    zeros = 0
+    out, zeros = bytearray(), 0
     for b in data:
         if zeros >= 2 and b <= 3:
-            out.append(0x03)  # emulation prevention byte
-            zeros = 0
+            out.append(0x03); zeros = 0
         out.append(b)
-        if b == 0:
-            zeros += 1
-        else:
-            zeros = 0
+        zeros = zeros + 1 if b == 0 else 0
     return bytes(out)
 
 def build_user_data_unregistered_sei(uuid_bytes: bytes, user_payload: bytes) -> bytes:
-    # SEI payloadType coding (0x05 = user_data_unregistered)
-    payload_type = b'\x05'
-    # payload = 16B UUID + your payload
+    # payloadType=5 (user_data_unregistered) with 0xFF extension coding
     body = uuid_bytes + user_payload
-    # payloadSize coding with 0xFF extensions if needed
     size = len(body)
     size_bytes = b''
     while size >= 255:
-        size_bytes += b'\xff'
-        size -= 255
+        size_bytes += b'\xff'; size -= 255
     size_bytes += bytes([size])
-    # rbsp: payloadType + payloadSize + body + rbsp_trailing_bits (1000 0000)
-    rbsp = payload_type + size_bytes + body + b'\x80'
-    rbsp = _emulation_prevention(rbsp)
-    # NAL start code + NAL header (type=6)
-    return b'\x00\x00\x00\x01' + b'\x06' + rbsp
 
-# ---------- pad probe: prepend SEI on IDR (key) frames ----------
+    rbsp = b'\x05' + size_bytes + body + b'\x80'          # trailing_bits
+    rbsp = _emulation_prevention(rbsp)
+    return b'\x00\x00\x00\x01' + b'\x06' + rbsp           # startcode + NAL type 6
+
+# ── Pad-probe injector ────────────────────────────────────────────────────────
 class SeiInjector:
     def __init__(self, uuid_str: str, meta_dict: dict, every_n: int = 0):
         self.uuid = uuidlib.UUID(uuid_str).bytes
-        self.meta = meta_dict
-        self.every_n = every_n
+        self.meta = dict(meta_dict)
+        self.every_n = int(every_n)
         self.frame_idx = 0
 
-    def _make_payload(self):
-        # keep it tiny; JSON is fine for demo
+    def _make_payload(self) -> bytes:
         self.meta["frame"] = self.frame_idx
         return json.dumps(self.meta, separators=(",", ":")).encode("utf-8")
 
@@ -54,83 +46,93 @@ class SeiInjector:
         buf = info.get_buffer()
         if not buf:
             return Gst.PadProbeReturn.OK
+
         self.frame_idx += 1
-
-        # keyframe check: DELTA_UNIT unset => keyframe
         is_key = not buf.has_flags(Gst.BufferFlags.DELTA_UNIT)
-        if not is_key and self.every_n > 0 and (self.frame_idx % self.every_n != 0):
-            return Gst.PadProbeReturn.OK
-        if not is_key and self.every_n <= 0:
+
+        # Inject on IDR; or every N if requested
+        if not is_key and (self.every_n <= 0 or (self.frame_idx % self.every_n) != 0):
             return Gst.PadProbeReturn.OK
 
-        payload = self._make_payload()
-        sei = build_user_data_unregistered_sei(self.uuid, payload)
+        sei = build_user_data_unregistered_sei(self.uuid, self._make_payload())
 
-        # stitch: new = [sei][orig]
+        # Make new buffer = [SEI][orig]
         orig_sz = buf.get_size()
         new_buf = Gst.Buffer.new_allocate(None, len(sei) + orig_sz, None)
-        #  don't copy DATA, and size=0
+
+        # copy flags / timestamps / metas (NOT data bytes)
         new_buf.copy_into(
             buf,
             Gst.BufferCopyFlags.FLAGS | Gst.BufferCopyFlags.TIMESTAMPS | Gst.BufferCopyFlags.META,
             0,
             0
         )
-        # write bytes
-        success, mapinfo = new_buf.map(Gst.MapFlags.WRITE)
-        if not success:
+
+        # read original bytes once
+        ok, o_map = buf.map(Gst.MapFlags.READ)
+        if not ok:
             return Gst.PadProbeReturn.OK
         try:
-            mapinfo.data[0:len(sei)] = sei
-            # extract original payload
-            o_success, o_map = buf.map(Gst.MapFlags.READ)
-            if not o_success:
-                return Gst.PadProbeReturn.OK
-            try:
-                mapinfo.data[len(sei):len(sei)+orig_sz] = o_map.data[:orig_sz]
-            finally:
-                buf.unmap(o_map)
+            orig_bytes = bytes(o_map.data)
         finally:
-            new_buf.unmap(mapinfo)
+            buf.unmap(o_map)
 
-        info.set_buffer(new_buf)
-        return Gst.PadProbeReturn.OK
+        # fill new buffer
+        new_buf.fill(0, sei)
+        new_buf.fill(len(sei), orig_bytes)
+
+        # IMPORTANT: replace the buffer in the probe
+        try:
+            info.set_data(new_buf)                  # preferred API
+        except AttributeError:
+            # some GI builds allow direct assignment
+            try:
+                info.data = new_buf                # fallback
+            except Exception:
+                return Gst.PadProbeReturn.OK
+        return Gst.PadProbeReturn.REPLACE
 
 def main():
     # usage:
-    # python inject_sei_sender.py 127.0.0.1 5000 ../demo/test2sec.avi <uuid> '{"user":"vladi","task":"demo"}'
-    host = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1"
-    port = int(sys.argv[2]) if len(sys.argv) > 2 else 5000
-    infile = sys.argv[3] if len(sys.argv) > 3 else "../demo/test2sec.avi"
+    # python inject_sei_sender.py 127.0.0.1 5000 ../demo/test2sec.avi <uuid> '{"user":"vladi"}' [every_n]
+    host     = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1"
+    port     = int(sys.argv[2]) if len(sys.argv) > 2 else 5000
+    infile   = sys.argv[3] if len(sys.argv) > 3 else "../demo/test2sec.avi"
     uuid_str = sys.argv[4] if len(sys.argv) > 4 else "12345678-1234-1234-1234-1234567890ab"
-    meta_json = sys.argv[5] if len(sys.argv) > 5 else '{"user":"demo","note":"sei"}'
+    meta_json= sys.argv[5] if len(sys.argv) > 5 else '{"user":"demo","note":"sei"}'
+    every_n  = int(sys.argv[6]) if len(sys.argv) > 6 else 0  # 0 = IDR-only
 
     meta = json.loads(meta_json)
 
     pipe_str = f"""
-    filesrc location={infile} !
-    decodebin ! videoconvert !
-    x264enc tune=zerolatency speed-preset=ultrafast bitrate=2000 key-int-max=30 !
-    h264parse config-interval=-1 name=hp ! video/x-h264,stream-format=byte-stream,alignment=au !
-    h264parse config-interval=1 ! video/x-h264,stream-format=avc,alignment=au !
-    matroskamux streamable=true !
-    tcpclientsink host={host} port={port}
+      filesrc location={infile} !
+      decodebin ! videoconvert !
+      x264enc tune=zerolatency speed-preset=ultrafast bitrate=2000 key-int-max=30 !
+      h264parse config-interval=-1 name=hp !
+        video/x-h264,stream-format=byte-stream,alignment=au !
+      h264parse config-interval=1 !
+        video/x-h264,stream-format=avc,alignment=au !
+      matroskamux streamable=true !
+      tcpclientsink host={host} port={port}
     """
 
     pipeline = Gst.parse_launch(pipe_str)
-    h264parse = pipeline.get_by_name("hp")
-    injector = SeiInjector(uuid_str, meta, every_n=0)  # set every_n>0 to inject regularly
-    pad = h264parse.get_static_pad("src")
-    pad.add_probe(Gst.PadProbeType.BUFFER, injector.cb)
+
+    # attach injector to Annex-B / AU pad (hp.src)
+    h264parse_au = pipeline.get_by_name("hp")
+    pad = h264parse_au.get_static_pad("src")
+    pad.add_probe(Gst.PadProbeType.BUFFER, SeiInjector(uuid_str, meta, every_n).cb)
 
     pipeline.set_state(Gst.State.PLAYING)
     bus = pipeline.get_bus()
     while True:
         msg = bus.timed_pop_filtered(Gst.SECOND, Gst.MessageType.ERROR | Gst.MessageType.EOS)
         if msg:
+            if msg.type == Gst.MessageType.ERROR:
+                err, dbg = msg.parse_error()
+                print("ERR:", err, "\nDBG:", dbg)
             break
     pipeline.set_state(Gst.State.NULL)
 
 if __name__ == "__main__":
-    GObject.threads_init()
     main()
