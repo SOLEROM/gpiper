@@ -36,8 +36,17 @@ For each buffer:
 
     Scan for NAL type 6, then for payload type “user_data_unregistered” (0x05 in H.264’s SEI payload type coding), read the UUID, and parse the rest as your custom payload.
 
+## issues
+
+Matroska/MP4 paths often don’t guarantee your extra user_data_unregistered SEIs will survive repack/rewrite. Encoders/muxers/parsers can coalesce SEIs, strip “non-essential” ones, or only keep the first prefix SEI (x264’s banner). So yes—SEI can work for lightweight, best-effort metadata, but it’s not 100% reliable across containers.
+
+If you must use Matroska/MP4 now:
+Inject your SEI after the final repack to AVC (length-prefixed) just before matroskamux/mp4mux. That bypasses the parser that was discarding it.
+
+
 
 ## run
 
 python extract_sei_receiver.py 5000 ../../out/received.mp4
+
 python inject_sei_sender.py 127.0.0.1 5000 ../../demo/test2sec.avi 12345678-1234-1234-1234-1234567890ab '{"user":"myUser","task":"gparted-pipe","note":"demo-1"}'
