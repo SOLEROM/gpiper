@@ -1,224 +1,326 @@
 #!/usr/bin/env python3
 """
-Simple test to verify metadata injection and extraction works locally
-Run this first to test if metadata works without UDP
+sei_working_test.py - Working SEI injection test for GStreamer 1.16
+Uses appsink/appsrc approach to modify buffers
 """
 
 import gi
 gi.require_version('Gst', '1.0')
-from gi.repository import Gst, GLib
-import sys
+gi.require_version('GstApp', '1.0')
+from gi.repository import Gst, GstApp, GLib
 import json
 import tempfile
+import os
+import threading
 
-def test_metadata_locally():
-    """Test metadata injection and extraction in a simple pipeline"""
+class SEIInjector:
+    """SEI NAL injection helper"""
     
-    metadata = {"user": "test", "timestamp": "2024-01-01", "session_id": "12345"}
+    CUSTOM_UUID = b'METADATA' + b'\x00' * 8
     
-    print("Testing metadata locally (no network)...")
-    print(f"Test metadata: {metadata}")
-    print("-" * 50)
-    
-    # Create a test video file if needed
-    with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as tmp:
-        output_file = tmp.name
-    
-    # Simple pipeline with metadata injection
-    # Properly escape the JSON for shell parsing
-    escaped_metadata = json.dumps(metadata).replace('"', '\\"')
-    
-    pipeline_str = f"""
-        videotestsrc num-buffers=100 ! 
-        video/x-raw,width=320,height=240,framerate=30/1 ! 
-        x264enc ! 
-        h264parse ! 
-        mp4mux ! 
-        filesink location={output_file}
-    """
-    
-    print(f"Creating test pipeline...")
-    try:
-        pipeline = Gst.parse_launch(pipeline_str)
-    except Exception as e:
-        print(f"Failed to create pipeline: {e}")
-        print("Trying alternative method...")
-        return
-    
-    # Now inject tags programmatically after pipeline creation
-    print("Injecting metadata programmatically...")
-    
-    # Create taglist
-    taglist = Gst.TagList.new_empty()
-    taglist.add_value(Gst.TagMergeMode.REPLACE, Gst.TAG_TITLE, "Test Video")
-    taglist.add_value(Gst.TagMergeMode.REPLACE, Gst.TAG_COMMENT, "user:test")
-    taglist.add_value(Gst.TagMergeMode.REPLACE, Gst.TAG_DESCRIPTION, f"metadata:{json.dumps(metadata)}")
-    
-    # Create tag setter to inject tags
-    # We'll send a tag event once pipeline starts
-    
-    # Set up bus monitoring
-    bus = pipeline.get_bus()
-    bus.add_signal_watch()
-    
-    extracted_tags = {}
-    
-    def on_message(bus, message):
-        t = message.type
-        if t == Gst.MessageType.TAG:
-            taglist = message.parse_tag()
-            if taglist:
-                print(f"\n✓ Tags detected in pipeline!")
-                for i in range(taglist.n_tags()):
-                    tag_name = taglist.nth_tag_name(i)
-                    success, value = taglist.get_string(tag_name)
-                    if success:
-                        extracted_tags[tag_name] = value
-                        print(f"  - {tag_name}: {value}")
-        elif t == Gst.MessageType.EOS:
-            print(f"\nPipeline completed. File saved to: {output_file}")
-            pipeline.set_state(Gst.State.NULL)
-            loop.quit()
-        elif t == Gst.MessageType.ERROR:
-            err, debug = message.parse_error()
-            print(f"Error: {err}")
-            pipeline.set_state(Gst.State.NULL)
-            loop.quit()
-    
-    bus.connect("message", on_message)
-    
-    # Inject tags after pipeline is created but before playing
-    def inject_tags():
-        # Find the muxer to inject tags
-        elements = pipeline.iterate_elements()
-        for element in elements:
-            if 'mux' in element.get_name().lower() or element.__class__.__name__ == 'GstMp4Mux':
-                print(f"Injecting tags into: {element.get_name()}")
-                tag_event = Gst.Event.new_tag(taglist)
-                element.send_event(tag_event)
-                break
-        return False  # Don't repeat
-    
-    # Schedule tag injection
-    GLib.idle_add(inject_tags)
-    
-    # Run pipeline
-    pipeline.set_state(Gst.State.PLAYING)
-    loop = GLib.MainLoop()
-    
-    try:
-        loop.run()
-    except KeyboardInterrupt:
-        pass
-    
-    print("\n" + "=" * 50)
-    print("RESULTS:")
-    if extracted_tags:
-        print("✅ Metadata injection WORKS!")
-        print(f"Extracted tags: {json.dumps(extracted_tags, indent=2)}")
-    else:
-        print("❌ No metadata extracted - there may be an issue with your GStreamer installation")
-    
-    # Now test reading the file
-    print("\n" + "=" * 50)
-    print("Testing reading metadata from saved file...")
-    
-    # Read metadata from the saved file
-    read_pipeline_str = f"""
-        filesrc location={output_file} ! 
-        qtdemux name=demux ! 
-        fakesink
-    """
-    
-    read_pipeline = Gst.parse_launch(read_pipeline_str)
-    read_bus = read_pipeline.get_bus()
-    read_bus.add_signal_watch()
-    
-    file_tags = {}
-    
-    def on_read_message(bus, message):
-        t = message.type
-        if t == Gst.MessageType.TAG:
-            taglist = message.parse_tag()
-            if taglist:
-                for i in range(taglist.n_tags()):
-                    tag_name = taglist.nth_tag_name(i)
-                    success, value = taglist.get_string(tag_name)
-                    if success:
-                        file_tags[tag_name] = value
-        elif t == Gst.MessageType.EOS:
-            read_pipeline.set_state(Gst.State.NULL)
-            read_loop.quit()
-    
-    read_bus.connect("message", on_read_message)
-    read_pipeline.set_state(Gst.State.PLAYING)
-    
-    read_loop = GLib.MainLoop()
-    GLib.timeout_add_seconds(2, lambda: read_loop.quit())
-    read_loop.run()
-    
-    if file_tags:
-        print("✅ Metadata persisted in file!")
-        print(f"File tags: {json.dumps(file_tags, indent=2)}")
-    else:
-        print("⚠️  No metadata found in saved file")
+    @staticmethod
+    def create_sei_nal(metadata_dict):
+        """Create SEI NAL unit with metadata"""
+        json_bytes = json.dumps(metadata_dict).encode('utf-8')
+        payload_size = 16 + len(json_bytes)
         
-    print("\n" + "=" * 50)
-    print("Testing UDP metadata transmission...")
+        sei_payload = bytearray()
+        sei_payload.append(0x05)  # user_data_unregistered
+        
+        # Add size
+        if payload_size < 255:
+            sei_payload.append(payload_size)
+        else:
+            size_remaining = payload_size
+            while size_remaining >= 255:
+                sei_payload.append(0xFF)
+                size_remaining -= 255
+            sei_payload.append(size_remaining)
+        
+        # Add UUID and data
+        sei_payload.extend(SEIInjector.CUSTOM_UUID)
+        sei_payload.extend(json_bytes)
+        sei_payload.append(0x80)  # RBSP stop bit
+        
+        # Complete SEI NAL
+        return b'\x00\x00\x00\x01\x06' + bytes(sei_payload)
     
-    # Test with UDP locally
-    udp_pipeline_str = f"""
-        filesrc location={output_file} ! 
-        qtdemux ! 
-        h264parse ! 
-        mpegtsmux ! 
-        tee name=t ! 
-        queue ! udpsink host=127.0.0.1 port=5555
-        t. ! queue ! fakesink
-    """
-    
-    # Also set up a receiver
-    receive_pipeline_str = """
-        udpsrc port=5555 ! 
-        tsdemux ! 
-        h264parse ! 
-        fakesink
-    """
-    
-    print("Note: For full UDP test, run the sender.py and receiver.py scripts")
-    
-    import os
-    os.unlink(output_file)  # Clean up temp file
-    
-    return extracted_tags
+    @staticmethod
+    def find_and_extract_sei(data):
+        """Find and extract metadata from SEI in data"""
+        i = 0
+        while i < len(data) - 20:
+            # Look for SEI NAL
+            if data[i:i+5] == b'\x00\x00\x00\x01\x06':
+                # Find end
+                end = len(data)
+                for j in range(i+5, min(i+500, len(data)-3)):
+                    if data[j:j+3] == b'\x00\x00\x01' or data[j:j+4] == b'\x00\x00\x00\x01':
+                        end = j
+                        break
+                
+                sei_data = data[i+5:end]
+                
+                # Parse SEI
+                k = 0
+                while k < len(sei_data) - 1:
+                    # Payload type
+                    payload_type = 0
+                    while k < len(sei_data) and sei_data[k] == 0xFF:
+                        payload_type += 255
+                        k += 1
+                    if k < len(sei_data):
+                        payload_type += sei_data[k]
+                        k += 1
+                    
+                    # Payload size
+                    payload_size = 0
+                    while k < len(sei_data) and sei_data[k] == 0xFF:
+                        payload_size += 255
+                        k += 1
+                    if k < len(sei_data):
+                        payload_size += sei_data[k]
+                        k += 1
+                    
+                    # Check for our UUID
+                    if payload_type == 5 and k + payload_size <= len(sei_data):
+                        payload = sei_data[k:k+payload_size]
+                        if len(payload) >= 16 and payload[:16] == SEIInjector.CUSTOM_UUID:
+                            try:
+                                json_str = payload[16:].rstrip(b'\x00\x80').decode('utf-8')
+                                return json.loads(json_str)
+                            except:
+                                pass
+                        k += payload_size
+                    else:
+                        break
+                
+                i = end
+            else:
+                i += 1
+        return None
 
-if __name__ == "__main__":
-    print("GStreamer Metadata Test")
-    print("=" * 50)
+def test_with_appsink_appsrc():
+    """Test using appsink/appsrc for buffer modification"""
     
-    # Initialize GStreamer first
     Gst.init(None)
     
-    # Check GStreamer version
-    version = Gst.version()
-    print(f"GStreamer version: {version[0]}.{version[1]}.{version[2]}")
+    print("=" * 70)
+    print("SEI INJECTION TEST WITH APPSINK/APPSRC")
+    print("=" * 70)
     
-    # Check for required plugins
-    required_plugins = ['coreelements', 'videoconvert', 'x264', 'typefindfunctions', 'mpegtsdemux', 'isomp4']
-    missing = []
+    metadata = {"user": "john", "timestamp": "2024-01-01", "session_id": "12345"}
     
-    registry = Gst.Registry.get()
-    for plugin_name in required_plugins:
-        plugin = registry.find_plugin(plugin_name)
-        if plugin:
-            print(f"✓ Plugin '{plugin_name}' found")
+    with tempfile.NamedTemporaryFile(suffix='.h264', delete=False) as tmp:
+        output_file = tmp.name
+    
+    print(f"Metadata: {metadata}")
+    print(f"Output: {output_file}")
+    print("-" * 70)
+    
+    # Statistics
+    stats = {
+        'keyframes': 0,
+        'sei_injected': 0,
+        'buffers': 0
+    }
+    
+    # Create pipelines
+    # Pipeline 1: Generate H.264 and send to appsink
+    gen_pipeline = Gst.parse_launch("""
+        videotestsrc num-buffers=100 !
+        video/x-raw,width=320,height=240,framerate=30/1 !
+        x264enc key-int-max=20 tune=zerolatency speed-preset=ultrafast bframes=0 !
+        h264parse !
+        appsink name=sink emit-signals=true
+    """)
+    
+    # Pipeline 2: Receive from appsrc and save
+    save_pipeline = Gst.parse_launch(f"""
+        appsrc name=src !
+        video/x-h264,stream-format=byte-stream !
+        filesink location={output_file}
+    """)
+    
+    appsink = gen_pipeline.get_by_name('sink')
+    appsrc = save_pipeline.get_by_name('src')
+    
+    def on_new_sample(sink):
+        """Handle new sample from appsink"""
+        sample = sink.emit("pull-sample")
+        if sample:
+            buffer = sample.get_buffer()
+            stats['buffers'] += 1
+            
+            # Check if keyframe
+            flags = buffer.get_flags()
+            is_keyframe = (flags & Gst.BufferFlags.DELTA_UNIT) == 0
+            
+            # Get buffer data
+            success, map_info = buffer.map(Gst.MapFlags.READ)
+            if success:
+                data = bytes(map_info.data)
+                buffer.unmap(map_info)
+                
+                # Inject SEI if keyframe
+                if is_keyframe:
+                    stats['keyframes'] += 1
+                    
+                    # Create SEI NAL
+                    sei_nal = SEIInjector.create_sei_nal(metadata)
+                    
+                    # Find insertion point
+                    insert_pos = 0
+                    if len(data) > 5 and data[:5] == b'\x00\x00\x00\x01\x09':
+                        # After AUD
+                        for i in range(5, min(50, len(data)-3)):
+                            if data[i:i+3] == b'\x00\x00\x01' or data[i:i+4] == b'\x00\x00\x00\x01':
+                                insert_pos = i
+                                break
+                    
+                    # Insert SEI
+                    if insert_pos > 0:
+                        new_data = data[:insert_pos] + sei_nal + data[insert_pos:]
+                    else:
+                        new_data = sei_nal + data
+                    
+                    # Create new buffer
+                    new_buffer = Gst.Buffer.new_wrapped(new_data)
+                    new_buffer.pts = buffer.pts
+                    new_buffer.dts = buffer.dts
+                    new_buffer.duration = buffer.duration
+                    
+                    # Push modified buffer
+                    appsrc.emit("push-buffer", new_buffer)
+                    
+                    stats['sei_injected'] += 1
+                    print(f"✅ Injected SEI #{stats['sei_injected']} (buffer #{stats['buffers']})")
+                else:
+                    # Push original buffer
+                    appsrc.emit("push-buffer", buffer)
+            
+        return Gst.FlowReturn.OK
+    
+    # Connect callback
+    appsink.connect("new-sample", on_new_sample)
+    
+    # Start pipelines
+    print("\nPhase 1: Injecting SEI...")
+    print("-" * 70)
+    
+    save_pipeline.set_state(Gst.State.PLAYING)
+    gen_pipeline.set_state(Gst.State.PLAYING)
+    
+    # Wait for completion
+    bus = gen_pipeline.get_bus()
+    msg = bus.timed_pop_filtered(10 * Gst.SECOND, Gst.MessageType.EOS | Gst.MessageType.ERROR)
+    
+    # Send EOS to appsrc
+    appsrc.emit("end-of-stream")
+    
+    # Wait for save pipeline
+    bus2 = save_pipeline.get_bus()
+    msg2 = bus2.timed_pop_filtered(5 * Gst.SECOND, Gst.MessageType.EOS | Gst.MessageType.ERROR)
+    
+    # Cleanup
+    gen_pipeline.set_state(Gst.State.NULL)
+    save_pipeline.set_state(Gst.State.NULL)
+    
+    print(f"\nResults:")
+    print(f"  • Buffers: {stats['buffers']}")
+    print(f"  • Keyframes: {stats['keyframes']}")
+    print(f"  • SEI injected: {stats['sei_injected']}")
+    
+    # Phase 2: Verify SEI in file
+    print("\n" + "=" * 70)
+    print("Phase 2: Verifying SEI in file...")
+    print("-" * 70)
+    
+    with open(output_file, 'rb') as f:
+        file_data = f.read()
+    
+    print(f"File size: {len(file_data):,} bytes")
+    
+    # Find SEI NAL units
+    sei_count = 0
+    extracted_count = 0
+    i = 0
+    
+    while i < len(file_data) - 5:
+        if file_data[i:i+5] == b'\x00\x00\x00\x01\x06':
+            sei_count += 1
+            print(f"\nFound SEI NAL #{sei_count} at offset {i}")
+            
+            # Try to extract metadata
+            extracted = SEIInjector.find_and_extract_sei(file_data[i:i+500])
+            if extracted:
+                extracted_count += 1
+                print(f"  ✅ Extracted metadata: {extracted}")
+                if extracted == metadata:
+                    print(f"  ✅ MATCHES ORIGINAL!")
+            
+            i += 5
         else:
-            print(f"✗ Plugin '{plugin_name}' MISSING")
-            missing.append(plugin_name)
+            i += 1
     
-    if missing:
-        print(f"\n⚠️  Missing plugins: {', '.join(missing)}")
-        print("Install with: sudo apt-get install gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly")
+    print(f"\nFile analysis:")
+    print(f"  • SEI NAL units found: {sei_count}")
+    print(f"  • Metadata extracted: {extracted_count}")
     
-    print("\n" + "=" * 50)
-    test_metadata_locally()
+    # Cleanup
+    os.unlink(output_file)
+    
+    # Final result
+    print("\n" + "=" * 70)
+    print("TEST RESULT")
+    print("=" * 70)
+    
+    if stats['sei_injected'] > 0 and extracted_count > 0:
+        print("✅ SUCCESS! SEI injection and extraction working!")
+        return True
+    else:
+        print("❌ FAILURE! SEI not working properly")
+        return False
+
+def test_simple_approach():
+    """Even simpler test - just create and verify SEI NAL"""
+    
+    print("\n" + "=" * 70)
+    print("SIMPLE SEI NAL UNIT TEST")
+    print("=" * 70)
+    
+    metadata = {"test": "data", "number": 123}
+    
+    # Create SEI NAL
+    sei_nal = SEIInjector.create_sei_nal(metadata)
+    
+    print(f"Created SEI NAL unit:")
+    print(f"  • Size: {len(sei_nal)} bytes")
+    print(f"  • First 20 bytes: {sei_nal[:20].hex()}")
+    print(f"  • Should start with: 0000000106 (start code + SEI NAL type)")
+    
+    # Test extraction
+    extracted = SEIInjector.find_and_extract_sei(sei_nal)
+    
+    print(f"\nExtraction test:")
+    print(f"  • Extracted: {extracted}")
+    print(f"  • Original: {metadata}")
+    print(f"  • Match: {extracted == metadata}")
+    
+    return extracted == metadata
+
+if __name__ == "__main__":
+    print("SEI NAL INJECTION TEST FOR GSTREAMER 1.16")
+    print()
+    
+    # Test 1: Simple SEI creation/extraction
+    if test_simple_approach():
+        print("\n✅ Basic SEI NAL creation/extraction works!")
+        
+        # Test 2: Full pipeline test
+        if test_with_appsink_appsrc():
+            print("\n✅ Full pipeline SEI injection works!")
+        else:
+            print("\n❌ Pipeline injection failed")
+    else:
+        print("\n❌ Basic SEI test failed")
