@@ -1,5 +1,0 @@
-gst-launch-1.0 -e -v \
-  tcpserversrc host=0.0.0.0 port=5000 ! \
-  matroskademux name=demux demux.video_0 ! queue ! \
-  h264parse ! mp4mux faststart=true ! \
-  filesink location=../out/received.mp4

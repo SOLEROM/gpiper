@@ -1,4 +1,4 @@
-# pyPAD
+[text](../pyPad)# pyPAD
 
 Hook a pad probe on h264parse.src
 
@@ -40,9 +40,8 @@ For each buffer:
 
 Matroska/MP4 paths often don’t guarantee your extra user_data_unregistered SEIs will survive repack/rewrite. Encoders/muxers/parsers can coalesce SEIs, strip “non-essential” ones, or only keep the first prefix SEI (x264’s banner). So yes—SEI can work for lightweight, best-effort metadata, but it’s not 100% reliable across containers.
 
-If you must use Matroska/MP4 now:
-Inject your SEI after the final repack to AVC (length-prefixed) just before matroskamux/mp4mux. That bypasses the parser that was discarding it.
-
+how to make it reliable?
+send a raw Annex-B H.264 elementary stream over TCP (no matroska/mp4 or re-mux). That preserves any SEI bytes you inject because nothing rewrites the bitstream. I provide working sender + receiver code that injects/extracts SEI and streams the raw Annex-B H.264 over TCP.
 
 
 ## run
