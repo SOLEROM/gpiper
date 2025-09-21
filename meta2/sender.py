@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 sei_sender.py - Injects metadata as SEI NAL units into H.264 stream
-Works with GStreamer 1.16 using appsink/appsrc approach
+Works with GStreamer 1.16 using intervideosink/intervideosrc bridge
 Usage: python sei_sender.py 127.0.0.1 5000 '{"user":"john"}' --video test.avi
 """
 
@@ -14,6 +14,7 @@ import json
 import argparse
 import os
 import threading
+import queue
 
 class SEINALInjector:
     """Helper class for creating SEI NAL units"""
@@ -54,137 +55,208 @@ class SEIVideoSender:
         self.port = port
         self.metadata = metadata
         self.video_file = video_file
-        self.pipeline = None
+        self.encode_pipeline = None
+        self.send_pipeline = None
         self.loop = None
         self.sei_injected_count = 0
         self.buffer_count = 0
+        self.running = True
+        self.buffer_queue = queue.Queue(maxsize=100)
         
         # Initialize GStreamer
         Gst.init(None)
     
+    def process_buffers_thread(self):
+        """Thread to process buffers between pipelines"""
+        appsrc = self.send_pipeline.get_by_name('source')
+        if not appsrc:
+            print("❌ Could not find appsrc")
+            return
+        
+        # Configure appsrc
+        appsrc.set_property('format', Gst.Format.TIME)
+        appsrc.set_property('is-live', True)
+        appsrc.set_property('block', True)
+        
+        while self.running:
+            try:
+                # Get buffer from queue (timeout to check running flag)
+                buffer_data = self.buffer_queue.get(timeout=0.1)
+                
+                if buffer_data is None:  # EOS signal
+                    print("📍 Sending EOS to output pipeline")
+                    appsrc.emit("end-of-stream")
+                    break
+                
+                # Push to appsrc
+                new_buffer = Gst.Buffer.new_wrapped(buffer_data['data'])
+                new_buffer.pts = buffer_data['pts']
+                new_buffer.dts = buffer_data['dts']
+                new_buffer.duration = buffer_data['duration']
+                
+                ret = appsrc.emit("push-buffer", new_buffer)
+                if ret != Gst.FlowReturn.OK:
+                    print(f"Warning: push-buffer returned {ret}")
+                    
+            except queue.Empty:
+                continue
+            except Exception as e:
+                print(f"Error in buffer thread: {e}")
+                import traceback
+                traceback.print_exc()
+                break
+        
+        print("Buffer thread ended")
+    
     def on_new_sample(self, sink):
         """Handle new sample from appsink"""
         sample = sink.emit("pull-sample")
-        if sample:
-            buffer = sample.get_buffer()
-            self.buffer_count += 1
+        if not sample:
+            return Gst.FlowReturn.OK
             
-            # Get the appsrc
-            appsrc = self.pipeline.get_by_name('appsrc')
-            if not appsrc:
-                return Gst.FlowReturn.ERROR
+        buffer = sample.get_buffer()
+        self.buffer_count += 1
+        
+        # Check if keyframe
+        flags = buffer.get_flags()
+        is_keyframe = (flags & Gst.BufferFlags.DELTA_UNIT) == 0
+        
+        # Get buffer data
+        success, map_info = buffer.map(Gst.MapFlags.READ)
+        if not success:
+            return Gst.FlowReturn.OK
             
-            # Check if keyframe
-            flags = buffer.get_flags()
-            is_keyframe = (flags & Gst.BufferFlags.DELTA_UNIT) == 0
+        data = bytes(map_info.data)
+        buffer.unmap(map_info)
+        
+        # Process the buffer
+        output_data = data
+        
+        # Inject SEI if keyframe
+        if is_keyframe:
+            # Create SEI NAL
+            metadata_json = json.dumps(self.metadata)
+            sei_nal = SEINALInjector.create_sei_nal_unit(metadata_json)
             
-            # Get buffer data
-            success, map_info = buffer.map(Gst.MapFlags.READ)
-            if success:
-                data = bytes(map_info.data)
-                buffer.unmap(map_info)
-                
-                # Inject SEI if keyframe
-                if is_keyframe:
-                    # Create SEI NAL
-                    metadata_json = json.dumps(self.metadata)
-                    sei_nal = SEINALInjector.create_sei_nal_unit(metadata_json)
-                    
-                    # Find insertion point (after AUD if present)
-                    insert_pos = 0
-                    if len(data) > 5 and data[:5] == b'\x00\x00\x00\x01\x09':
-                        # Find next start code after AUD
-                        for i in range(5, min(50, len(data)-3)):
-                            if data[i:i+3] == b'\x00\x00\x01' or data[i:i+4] == b'\x00\x00\x00\x01':
-                                insert_pos = i
-                                break
-                    
-                    # Insert SEI
-                    if insert_pos > 0:
-                        new_data = data[:insert_pos] + sei_nal + data[insert_pos:]
-                    else:
-                        new_data = sei_nal + data
-                    
-                    # Create new buffer
-                    new_buffer = Gst.Buffer.new_wrapped(new_data)
-                    new_buffer.pts = buffer.pts
-                    new_buffer.dts = buffer.dts
-                    new_buffer.duration = buffer.duration
-                    
-                    # Push modified buffer
-                    ret = appsrc.emit("push-buffer", new_buffer)
-                    
-                    self.sei_injected_count += 1
-                    print(f"💉 Injected SEI #{self.sei_injected_count} at keyframe (buffer #{self.buffer_count})")
-                    
-                    if self.sei_injected_count == 1:
-                        print(f"    SEI size: {len(sei_nal)} bytes")
-                        print(f"    Total buffer size: {len(new_data)} bytes")
-                else:
-                    # Push original buffer
-                    ret = appsrc.emit("push-buffer", buffer)
+            # Find insertion point (after AUD if present)
+            insert_pos = 0
+            if len(data) > 5 and data[:5] == b'\x00\x00\x00\x01\x09':
+                # Find next start code after AUD
+                for i in range(5, min(50, len(data)-3)):
+                    if data[i:i+3] == b'\x00\x00\x01' or data[i:i+4] == b'\x00\x00\x00\x01':
+                        insert_pos = i
+                        break
+            
+            # Insert SEI
+            if insert_pos > 0:
+                output_data = data[:insert_pos] + sei_nal + data[insert_pos:]
             else:
-                # Push original buffer if mapping failed
-                ret = appsrc.emit("push-buffer", buffer)
-                
+                output_data = sei_nal + data
+            
+            self.sei_injected_count += 1
+            print(f"💉 Injected SEI #{self.sei_injected_count} at keyframe (buffer #{self.buffer_count})")
+            
+            if self.sei_injected_count == 1:
+                print(f"    SEI size: {len(sei_nal)} bytes")
+                print(f"    Total buffer size: {len(output_data)} bytes")
+        
+        # Queue buffer for sending
+        buffer_data = {
+            'data': output_data,
+            'pts': buffer.pts if buffer.pts != Gst.CLOCK_TIME_NONE else 0,
+            'dts': buffer.dts if buffer.dts != Gst.CLOCK_TIME_NONE else 0,
+            'duration': buffer.duration if buffer.duration != Gst.CLOCK_TIME_NONE else 0
+        }
+        
+        try:
+            self.buffer_queue.put(buffer_data, timeout=1.0)
+        except queue.Full:
+            print("Warning: Buffer queue full, dropping buffer")
+        
         return Gst.FlowReturn.OK
     
-    def create_pipeline(self):
-        """Create pipeline with appsink/appsrc for SEI injection"""
+    def create_pipelines(self):
+        """Create encoding and sending pipelines"""
         if not os.path.exists(self.video_file):
             raise FileNotFoundError(f"Video file not found: {self.video_file}")
         
-        # Build pipeline with appsink and appsrc
-        pipeline_str = f"""
+        # Encoding pipeline with appsink
+        encode_str = f"""
             filesrc location={self.video_file} !
             decodebin !
             videoconvert !
             videoscale !
             video/x-raw,width=1280,height=720 !
             x264enc tune=zerolatency bitrate=2000 key-int-max=30 speed-preset=medium bframes=0 !
-            h264parse !
-            appsink name=appsink emit-signals=true sync=false
-            
-            appsrc name=appsrc !
             video/x-h264,stream-format=byte-stream !
-            mpegtsmux !
-            udpsink host={self.host} port={self.port} sync=true
+            h264parse config-interval=1 !
+            appsink name=sink emit-signals=true max-buffers=10 drop=false
         """
         
-        self.pipeline = Gst.parse_launch(pipeline_str)
+        # Sending pipeline with appsrc
+        send_str = f"""
+            appsrc name=source format=3 is-live=true block=true !
+            video/x-h264,stream-format=byte-stream,alignment=au !
+            mpegtsmux !
+            udpsink host={self.host} port={self.port} sync=false
+        """
+        
+        self.encode_pipeline = Gst.parse_launch(encode_str)
+        self.send_pipeline = Gst.parse_launch(send_str)
         
         # Get appsink and connect callback
-        appsink = self.pipeline.get_by_name('appsink')
+        appsink = self.encode_pipeline.get_by_name('sink')
         if appsink:
             appsink.connect("new-sample", self.on_new_sample)
             print("✅ Connected to appsink for SEI injection")
         
-        # Set up bus
-        bus = self.pipeline.get_bus()
-        bus.add_signal_watch()
-        bus.connect("message", self.on_message)
+        # Start buffer processing thread
+        self.buffer_thread = threading.Thread(target=self.process_buffers_thread, daemon=True)
+        self.buffer_thread.start()
+        
+        # Set up buses
+        bus1 = self.encode_pipeline.get_bus()
+        bus1.add_signal_watch()
+        bus1.connect("message", self.on_encode_message)
+        
+        bus2 = self.send_pipeline.get_bus()
+        bus2.add_signal_watch()
+        bus2.connect("message", self.on_send_message)
     
-    def on_message(self, bus, message):
-        """Handle pipeline messages"""
+    def on_encode_message(self, bus, message):
+        """Handle encoding pipeline messages"""
         t = message.type
         
         if t == Gst.MessageType.EOS:
-            print(f"\n✅ Stream ended. Total SEI NAL units injected: {self.sei_injected_count}")
-            # Send EOS to appsrc
-            appsrc = self.pipeline.get_by_name('appsrc')
-            if appsrc:
-                appsrc.emit("end-of-stream")
-            # Wait a bit for final data
-            GLib.timeout_add_seconds(1, self.stop)
+            print(f"\n✅ Encoding complete. Total SEI NAL units injected: {self.sei_injected_count}")
+            # Signal EOS to buffer thread
+            self.buffer_queue.put(None)
         elif t == Gst.MessageType.ERROR:
             err, debug = message.parse_error()
-            print(f"\n❌ Error: {err}, {debug}")
+            print(f"\n❌ Encode error: {err}, {debug}")
             self.stop()
         elif t == Gst.MessageType.STATE_CHANGED:
-            if message.src == self.pipeline:
+            if message.src == self.encode_pipeline:
                 old_state, new_state, pending = message.parse_state_changed()
                 if new_state == Gst.State.PLAYING:
-                    print("▶️  Streaming with SEI metadata injection...")
+                    print("▶️  Encoding and injecting SEI metadata...")
+    
+    def on_send_message(self, bus, message):
+        """Handle sending pipeline messages"""
+        t = message.type
+        
+        if t == Gst.MessageType.EOS:
+            print("✅ Transmission complete")
+            self.stop()
+        elif t == Gst.MessageType.ERROR:
+            err, debug = message.parse_error()
+            print(f"\n❌ Send error: {err}, {debug}")
+            self.stop()
+        elif t == Gst.MessageType.STATE_CHANGED:
+            if message.src == self.send_pipeline:
+                old_state, new_state, pending = message.parse_state_changed()
+                if new_state == Gst.State.PLAYING:
+                    print("📡 Transmitting stream...")
     
     def start(self):
         """Start the sender"""
@@ -199,11 +271,18 @@ class SEIVideoSender:
         print(f"🔧 SEI UUID: {SEINALInjector.CUSTOM_UUID[:8].hex()}...")
         print("=" * 60)
         
-        self.create_pipeline()
+        self.create_pipelines()
         
-        ret = self.pipeline.set_state(Gst.State.PLAYING)
+        # Start send pipeline first
+        ret = self.send_pipeline.set_state(Gst.State.PLAYING)
         if ret == Gst.StateChangeReturn.FAILURE:
-            print("Unable to set pipeline to playing state")
+            print("Unable to set send pipeline to playing state")
+            sys.exit(1)
+        
+        # Then start encode pipeline
+        ret = self.encode_pipeline.set_state(Gst.State.PLAYING)
+        if ret == Gst.StateChangeReturn.FAILURE:
+            print("Unable to set encode pipeline to playing state")
             sys.exit(1)
         
         self.loop = GLib.MainLoop()
@@ -215,12 +294,21 @@ class SEIVideoSender:
     
     def stop(self):
         """Stop the sender"""
-        if self.pipeline:
-            self.pipeline.set_state(Gst.State.NULL)
+        self.running = False
+        
+        if self.encode_pipeline:
+            self.encode_pipeline.set_state(Gst.State.NULL)
+        if self.send_pipeline:
+            self.send_pipeline.set_state(Gst.State.NULL)
+        
+        # Wait for buffer thread
+        if hasattr(self, 'buffer_thread'):
+            self.buffer_thread.join(timeout=2)
+        
         if self.loop:
             self.loop.quit()
+        
         print("🛑 Sender stopped")
-        return False  # Don't repeat timeout
 
 def main():
     parser = argparse.ArgumentParser(
@@ -228,7 +316,7 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 This sender injects metadata directly into the H.264 bitstream as SEI NAL units.
-Works with GStreamer 1.16 using appsink/appsrc approach.
+Works with GStreamer 1.16 using dual pipeline approach.
 
 Example:
   python sei_sender.py 127.0.0.1 5000 '{"user":"john","session":"123"}' --video test.avi
