@@ -1,7 +1,9 @@
+
 #!/usr/bin/env python3
 """
-sei_direct_sender.py - Sends H.264 with SEI directly over UDP (no MPEG-TS)
-This avoids MPEG-TS stripping the SEI NAL units
+rtp_sei_sender.py - Sends H.264 video with SEI metadata over RTP/UDP
+Single port, preserves SEI NAL units
+Usage: python rtp_sei_sender.py 127.0.0.1 5000 '{"user":"john"}' --video test.avi
 """
 
 import gi
@@ -42,13 +44,13 @@ class SEINALInjector:
         
         return b'\x00\x00\x00\x01\x06' + bytes(sei_payload)
 
-class DirectSEISender:
+class RTPSEISender:
     def __init__(self, host, port, metadata, video_file):
         self.host = host
         self.port = port
         self.metadata = metadata
         self.video_file = video_file
-        self.pipeline = None
+        self.encode_pipeline = None
         self.send_pipeline = None
         self.sei_injected_count = 0
         self.buffer_count = 0
@@ -56,15 +58,15 @@ class DirectSEISender:
         Gst.init(None)
     
     def on_new_sample(self, sink):
-        """Handle new sample from appsink"""
+        """Handle new sample from appsink and inject SEI"""
         sample = sink.emit("pull-sample")
         if not sample:
             return Gst.FlowReturn.OK
-            
+        
         buffer = sample.get_buffer()
         self.buffer_count += 1
         
-        # Get appsrc in send pipeline
+        # Get appsrc
         appsrc = self.send_pipeline.get_by_name('src')
         if not appsrc:
             return Gst.FlowReturn.ERROR
@@ -77,19 +79,19 @@ class DirectSEISender:
         success, map_info = buffer.map(Gst.MapFlags.READ)
         if not success:
             return Gst.FlowReturn.OK
-            
+        
         data = bytes(map_info.data)
         buffer.unmap(map_info)
         
         # Process buffer
         output_data = data
         
-        if is_keyframe:
+        if is_keyframe and self.sei_injected_count < 10:  # Inject SEI at first 10 keyframes
             # Create SEI NAL
             metadata_json = json.dumps(self.metadata)
             sei_nal = SEINALInjector.create_sei_nal_unit(metadata_json)
             
-            # Find insertion point
+            # Find insertion point (after AUD if present, otherwise at start)
             insert_pos = 0
             if len(data) > 5 and data[:5] == b'\x00\x00\x00\x01\x09':
                 # After AUD
@@ -109,55 +111,64 @@ class DirectSEISender:
             
             if self.sei_injected_count == 1:
                 print(f"    SEI size: {len(sei_nal)} bytes")
-                print(f"    Output starts with: {output_data[:20].hex()}")
+                print(f"    First 40 bytes of output: {output_data[:40].hex()}")
         
-        # Create new buffer with modified data
+        # Create new buffer and push to appsrc
         new_buffer = Gst.Buffer.new_wrapped(output_data)
         new_buffer.pts = buffer.pts
         new_buffer.dts = buffer.dts
         new_buffer.duration = buffer.duration
         
-        # Push to appsrc
         ret = appsrc.emit("push-buffer", new_buffer)
+        if ret != Gst.FlowReturn.OK:
+            print(f"Warning: push-buffer returned {ret}")
         
         return Gst.FlowReturn.OK
     
     def create_pipelines(self):
-        """Create encode and send pipelines"""
+        """Create separate encode and send pipelines connected via appsink/appsrc"""
         if not os.path.exists(self.video_file):
             raise FileNotFoundError(f"Video file not found: {self.video_file}")
         
-        # Encoding pipeline
+        # Encoding pipeline - outputs to appsink
         encode_str = f"""
             filesrc location={self.video_file} !
             decodebin !
             videoconvert !
             videoscale !
-            video/x-raw,width=1280,height=720 !
+            video/x-raw,width=1280,height=720,framerate=30/1 !
             x264enc tune=zerolatency bitrate=2000 key-int-max=30 speed-preset=medium bframes=0 !
             video/x-h264,stream-format=byte-stream !
             h264parse config-interval=1 !
-            appsink name=sink emit-signals=true
+            appsink name=sink emit-signals=true sync=false
         """
         
-        # Direct UDP sending pipeline (no MPEG-TS!)
+        # RTP sending pipeline - receives from appsrc
         send_str = f"""
-            appsrc name=src !
+            appsrc name=src format=3 is-live=true !
             video/x-h264,stream-format=byte-stream,alignment=au !
-            rtph264pay config-interval=1 pt=96 !
-            udpsink host={self.host} port={self.port}
+            rtph264pay config-interval=1 mtu=1400 pt=96 !
+            application/x-rtp,media=video,encoding-name=H264,payload=96 !
+            udpsink host={self.host} port={self.port} sync=false
         """
         
-        self.pipeline = Gst.parse_launch(encode_str)
+        self.encode_pipeline = Gst.parse_launch(encode_str)
         self.send_pipeline = Gst.parse_launch(send_str)
         
-        # Connect appsink
-        appsink = self.pipeline.get_by_name('sink')
-        appsink.connect("new-sample", self.on_new_sample)
-        print("✅ Connected pipelines for direct H.264 transmission")
+        # Connect appsink callback
+        appsink = self.encode_pipeline.get_by_name('sink')
+        if appsink:
+            appsink.connect("new-sample", self.on_new_sample)
+            print("✅ Connected appsink for SEI injection")
+        
+        # Configure appsrc
+        appsrc = self.send_pipeline.get_by_name('src')
+        if appsrc:
+            appsrc.set_property('format', Gst.Format.TIME)
+            appsrc.set_property('is-live', True)
         
         # Set up buses
-        bus1 = self.pipeline.get_bus()
+        bus1 = self.encode_pipeline.get_bus()
         bus1.add_signal_watch()
         bus1.connect("message", self.on_encode_message)
         
@@ -166,75 +177,113 @@ class DirectSEISender:
         bus2.connect("message", self.on_send_message)
     
     def on_encode_message(self, bus, message):
+        """Handle encoding pipeline messages"""
         t = message.type
+        
         if t == Gst.MessageType.EOS:
-            print(f"✅ Encoding complete. SEI injected: {self.sei_injected_count}")
+            print(f"\n✅ Encoding complete. SEI injected: {self.sei_injected_count}")
+            # Send EOS to appsrc
             appsrc = self.send_pipeline.get_by_name('src')
             if appsrc:
                 appsrc.emit("end-of-stream")
         elif t == Gst.MessageType.ERROR:
             err, debug = message.parse_error()
-            print(f"❌ Encode error: {err}")
+            print(f"\n❌ Encode error: {err}")
             self.stop()
+        elif t == Gst.MessageType.STATE_CHANGED:
+            if message.src == self.encode_pipeline:
+                old_state, new_state, pending = message.parse_state_changed()
+                if new_state == Gst.State.PLAYING:
+                    print("▶️  Encoding started...")
     
     def on_send_message(self, bus, message):
+        """Handle sending pipeline messages"""
         t = message.type
+        
         if t == Gst.MessageType.EOS:
             print("✅ Transmission complete")
             self.stop()
         elif t == Gst.MessageType.ERROR:
             err, debug = message.parse_error()
-            print(f"❌ Send error: {err}")
+            print(f"\n❌ Send error: {err}")
             self.stop()
+        elif t == Gst.MessageType.STATE_CHANGED:
+            if message.src == self.send_pipeline:
+                old_state, new_state, pending = message.parse_state_changed()
+                if new_state == Gst.State.PLAYING:
+                    print("📡 RTP transmission started...")
     
     def start(self):
+        """Start the sender"""
         print("=" * 60)
-        print("DIRECT H.264 SEI SENDER (No MPEG-TS)")
+        print("RTP/H.264 SEI SENDER (Single Port)")
         print("=" * 60)
         print(f"📹 Source: {self.video_file}")
         print(f"🌐 Destination: {self.host}:{self.port}")
-        print(f"📦 Metadata: {self.metadata}")
-        print(f"🔧 Transport: RTP/H.264 (preserves SEI)")
+        print(f"📦 Metadata to inject:")
+        for key, value in self.metadata.items():
+            print(f"   • {key}: {value}")
+        print(f"🔧 Protocol: RTP/H.264 over UDP (preserves SEI)")
         print("=" * 60)
         
         self.create_pipelines()
         
-        # Start both pipelines
-        self.send_pipeline.set_state(Gst.State.PLAYING)
-        self.pipeline.set_state(Gst.State.PLAYING)
+        # Start send pipeline first, then encode pipeline
+        ret = self.send_pipeline.set_state(Gst.State.PLAYING)
+        if ret == Gst.StateChangeReturn.FAILURE:
+            print("Unable to set send pipeline to playing state")
+            sys.exit(1)
+        
+        ret = self.encode_pipeline.set_state(Gst.State.PLAYING)
+        if ret == Gst.StateChangeReturn.FAILURE:
+            print("Unable to set encode pipeline to playing state")
+            sys.exit(1)
         
         self.loop = GLib.MainLoop()
         try:
             self.loop.run()
         except KeyboardInterrupt:
-            print("\n⏹️ Interrupted")
+            print("\n⏹️  Interrupted by user")
             self.stop()
     
     def stop(self):
-        if self.pipeline:
-            self.pipeline.set_state(Gst.State.NULL)
+        """Stop the sender"""
+        if self.encode_pipeline:
+            self.encode_pipeline.set_state(Gst.State.NULL)
         if self.send_pipeline:
             self.send_pipeline.set_state(Gst.State.NULL)
         if hasattr(self, 'loop') and self.loop:
             self.loop.quit()
-        print("🛑 Stopped")
+        print("🛑 Sender stopped")
 
 def main():
-    parser = argparse.ArgumentParser(description='Direct H.264 SEI sender')
-    parser.add_argument('host', help='Destination IP')
+    parser = argparse.ArgumentParser(
+        description='RTP/H.264 sender with SEI metadata preservation',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Single-port metadata transmission using SEI NAL units in RTP/H.264 stream.
+The metadata is embedded directly in the H.264 bitstream and preserved by RTP.
+
+Example:
+  python rtp_sei_sender.py 127.0.0.1 5000 '{"user":"john","session":"123"}' --video test.avi
+        """
+    )
+    
+    parser.add_argument('host', help='Destination IP address')
     parser.add_argument('port', type=int, help='UDP port')
-    parser.add_argument('metadata', help='JSON metadata')
+    parser.add_argument('metadata', help='JSON metadata to inject')
     parser.add_argument('--video', required=True, help='Input video file')
     
     args = parser.parse_args()
     
+    # Parse metadata
     try:
         metadata = json.loads(args.metadata)
     except json.JSONDecodeError as e:
-        print(f"Invalid JSON: {e}")
+        print(f"Error: Invalid JSON metadata: {e}")
         sys.exit(1)
     
-    sender = DirectSEISender(args.host, args.port, metadata, args.video)
+    sender = RTPSEISender(args.host, args.port, metadata, args.video)
     sender.start()
 
 if __name__ == '__main__':
