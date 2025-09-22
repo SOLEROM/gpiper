@@ -1,5 +1,7 @@
 # about
 
+![alt text](image-1.png)
+
 ## general
 * [deps](./deps.md) and install
 * [plugins](./plugins.md)
