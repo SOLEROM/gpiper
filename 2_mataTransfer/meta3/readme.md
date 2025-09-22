@@ -1,32 +1,37 @@
+# TP/H.264 Over UDP 
+
+* Perfect for SEI + Compression
+* Single UDP port - Everything in one stream
+* Full H.264 compression - Same video compression as before
+* SEI NAL units preserved - RTP doesn't strip them
+* Standard protocol - Used by WebRTC, VoIP, IP cameras
 
 
-TP/H.264 Over UDP - Perfect for SEI + Compression
-What You Get:
-
-Single UDP port - Everything in one stream
-Full H.264 compression - Same video compression as before
-SEI NAL units preserved - RTP doesn't strip them
-Standard protocol - Used by WebRTC, VoIP, IP cameras
-
-
+```
 [AVI File] → [H.264 Encode + SEI Injection] → [RTP Packetization] → UDP Port 5000
                                                                        ↓
 [MP4 File] ← [H.264 Decode + SEI Extract] ← [RTP Depacketization] ← UDP Port 5000
-
+```
 
 ## diffs from before
 
+```
 MPEG-TS Structure:
     [MPEG-TS Header][PES Header][H.264 Data (SEI stripped)]
 RTP Structure:
     [RTP Header][H.264 Data (SEI preserved)]
-
+```
 
 
 ## test
 
+```
 python receiver.py 5000 ../out/received.mp4
+
 python sender.py 127.0.0.1 5000 '{"user":"john","timestamp":"2024-01-01","session_id":"12345"}' --video ../demo/test2sec.avi
+```
+
+## example
 
 ```
  python receiver.py 5000 ../out/received.mp4

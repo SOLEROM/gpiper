@@ -121,19 +121,24 @@ TEST RESULT
 
 ## run
 
+```
 python receiver.py 5000 ../out/received.mp4
 
 python sender.py 127.0.0.1 5000 '{"user":"john","timestamp":"2024-01-01","session_id":"12345"}' --video ../demo/test2sec.avi
+```
+
 
 ## fails?
 
-Why MPEG-TS Failed
+Why MPEG-TS Failed? 
+
 MPEG-TS is designed for broadcast TV and only preserves NAL units defined in the MPEG-TS specification:
 
-SPS/PPS (configuration)
-AUD (access unit delimiters)
-Slice data (actual video)
-NOT SEI - considered "supplemental" and stripped
-
+  ```
+  SPS/PPS (configuration)
+  AUD (access unit delimiters)
+  Slice data (actual video)
+  NOT SEI - considered "supplemental" and stripped
+  ```
 
 

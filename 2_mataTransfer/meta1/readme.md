@@ -1,7 +1,8 @@
 # meta side channel
 
 * MPEG-TS (Transport Stream) doesn't preserve GStreamer tags. 
-* see 2 shells 2sideTags to see that the metadata is stripped but better the next test that shows the metadata is saved in mp4 file but not transmitted over mpeg-ts;
+* see 2 shells 2sideTags to see that the metadata is stripped 
+* use the test that shows the metadata is saved in mp4 file but not transmitted over mpeg-ts;
 
 
 ``` 
@@ -66,20 +67,20 @@ Benefits:
 
 ### sender.py:
 
-Sends video on the specified port (e.g., 5000)
-Sends metadata on port+1 (e.g., 5001)
-Sends metadata 3 times to ensure delivery
-Clear status messages and progress indicators
-Proper error handling
+* Sends video on the specified port (e.g., 5000)
+* Sends metadata on port+1 (e.g., 5001)
+* Sends metadata 3 times to ensure delivery
+* Clear status messages and progress indicators
+* Proper error handling
 
 ### receiver.py:
 
-Listens for video on the specified port
-Listens for metadata on port+1
-Saves video as MP4
-Saves metadata as JSON file
-Shows received metadata in real-time
-Handles timeouts gracefully
+* Listens for video on the specified port
+* Listens for metadata on port+1
+* Saves video as MP4
+* Saves metadata as JSON file
+* Shows received metadata in real-time
+* Handles timeouts gracefully
 
 ## run
 
