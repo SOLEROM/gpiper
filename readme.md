@@ -11,3 +11,4 @@
 ## Demos
 * [simple pipes](./1_simpPipes/readme.md)
 * [transfer metadata](./2_mataTransfer/readme.md)
+* [python post of gstream](./3_pypost/readme.md)
