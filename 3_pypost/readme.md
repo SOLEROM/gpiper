@@ -2,6 +2,7 @@
 
 ways to move data from the gstreamer pipe to python post processing
 
+## method1: idenity 
 * [idenity](./identity.md) explained 
     * see demo1: basic idenity
     
@@ -14,5 +15,7 @@ ways to move data from the gstreamer pipe to python post processing
         > python idenity_demo2_x86_send.py --port 5000 --draw-position
         > python idenity_demo2_x86_get.py --port 5000
     ```
+    ![alt text](image-1.png)
 
-* [appsink](./appsink.md)
+## method2: appsink
+* [appsink](./appsink.md) explained
