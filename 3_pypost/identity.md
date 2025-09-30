@@ -3,6 +3,41 @@
  "fast conveyor belt (the GStreamer pipeline) that hands your Python code a box (a Gst.Buffer) every time a frame goes by—and you attached a bell to the belt so you can grab the box for a peek."
 
 
+```
+gst-inspect-1.0 identity   
+Factory Details:
+  Rank                     none (0)
+  Long-name                Identity
+  Klass                    Generic
+  Description              Pass data without modification
+  Author                   Erik Walthinsen <omega@cse.ogi.edu>
+
+
+Plugin Details:
+  Name                     coreelements
+  Description              GStreamer core elements
+  Filename                 /usr/lib/x86_64-linux-gnu/gstreamer-1.0/libgstcoreelements.so
+  Version                  1.16.3
+  License                  LGPL
+  Source module            gstreamer
+  Source release date      2020-10-21
+  Binary package           GStreamer (Ubuntu)
+  Origin URL               https://launchpad.net/distros/ubuntu/+source/gstreamer1.0
+
+GObject
+ +----GInitiallyUnowned
+       +----GstObject
+             +----GstElement
+                   +----GstBaseTransform
+
+
+```
+
+identity lives in the Core Plugins under the plugin called coreelements (the same family that ships queue, fakesink, filesrc, etc.).
+
+called the identity transform—like the math function f(x)=x. It forwards each buffer unchanged, but offers handy debug knobs.
+
+
 ## (1)  create chain
 
 create a chain of C objects pushing Gst.Buffer objects from source → sink. Every buffer is a chunk of memory + timestamps + optional metadata. 
