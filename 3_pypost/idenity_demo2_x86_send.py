@@ -18,7 +18,6 @@ def build_pipeline(host, port, width, height, fps):
                                   │    videoconvert → autovideosink
                                   └─ branch B: (UDP)
                                        videoconvert → I420 → x264enc → rtph264pay → udpsink
-    Place identity BEFORE tee so any pixel edits affect BOTH branches.
     """
     pipe = f"""
 videotestsrc pattern=ball is-live=true !
@@ -59,6 +58,58 @@ def find_brightest_spot(data, width, height, stride):
     
     return ball_x, ball_y
 
+def draw_crosshair(buffer, x, y, width, height, stride, size=10, color=(0, 255, 0)):
+    """Draw a crosshair at the given position"""
+    bpp = 3
+    r, g, b = color
+    
+    # Draw horizontal line
+    for dx in range(-size, size + 1):
+        px = x + dx
+        if 0 <= px < width and 0 <= y < height:
+            offset = y * stride + px * bpp
+            seg = bytearray([r, g, b])
+            buffer.fill(offset, bytes(seg))
+    
+    # Draw vertical line
+    for dy in range(-size, size + 1):
+        py = y + dy
+        if 0 <= x < width and 0 <= py < height:
+            offset = py * stride + x * bpp
+            seg = bytearray([r, g, b])
+            buffer.fill(offset, bytes(seg))
+
+def draw_circle(buffer, cx, cy, width, height, stride, radius=5, color=(255, 0, 0)):
+    """Draw a circle outline at the given position"""
+    bpp = 3
+    r, g, b = color
+    
+    # Draw circle using midpoint circle algorithm (just the outline)
+    for angle in range(0, 360, 5):  # Sample every 5 degrees
+        import math
+        rad = math.radians(angle)
+        dx = int(radius * math.cos(rad))
+        dy = int(radius * math.sin(rad))
+        px, py = cx + dx, cy + dy
+        
+        if 0 <= px < width and 0 <= py < height:
+            offset = py * stride + px * bpp
+            seg = bytearray([r, g, b])
+            buffer.fill(offset, bytes(seg))
+
+def draw_box(buffer, x, y, w, h, width, height, stride, color=(255, 255, 0)):
+    """Draw a filled rectangle"""
+    bpp = 3
+    r, g, b = color
+    
+    for dy in range(h):
+        for dx in range(w):
+            px, py = x + dx, y + dy
+            if 0 <= px < width and 0 <= py < height:
+                offset = py * stride + px * bpp
+                seg = bytearray([r, g, b])
+                buffer.fill(offset, bytes(seg))
+
 def on_handoff(element, buffer, pad, args):
     """Per-frame callback on the SENDING side."""
     global FRAME_COUNTER
@@ -91,64 +142,63 @@ def on_handoff(element, buffer, pad, args):
         width, height = vmeta.width, vmeta.height
         stride = vmeta.stride[0] if vmeta.n_planes > 0 else width * 3
 
-    # Map buffer for reading
+    # Map buffer for reading to find ball
     ok, info = buffer.map(Gst.MapFlags.READ)
     if not ok:
         return
     
     try:
         data = info.data
-        
-        # Find ball position
         ball_x, ball_y = find_brightest_spot(data, width, height, stride)
-        
-        # Calculate mean brightness in center region
-        cx, cy = width // 2, height // 2
-        rw, rh = 80, 60
-        x0, y0 = max(0, cx - rw // 2), max(0, cy - rh // 2)
-        x1, y1 = min(width, x0 + rw), min(height, y0 + rh)
-
-        s = 0
-        n = 0
-        bpp = 3
-        for y in range(y0, y1, 2):
-            row = y * stride
-            for x in range(x0, x1, 2):
-                p = row + x * bpp
-                r, g, b = data[p], data[p+1], data[p+2]
-                s += (r*3 + g*6 + b*1)
-                n += 10
-        mean_luma = (s / n) if n else 0.0
-        
     finally:
         buffer.unmap(info)
 
-    # Optional: mutate pixels IN THE LIVE BUFFER so both branches see it
+    # Draw visual overlays on the video
+    if args.draw_position:
+        # Draw green crosshair at ball position
+        draw_crosshair(buffer, ball_x, ball_y, width, height, stride, size=15, color=(0, 255, 0))
+        
+        # Draw red circle around ball
+        draw_circle(buffer, ball_x, ball_y, width, height, stride, radius=12, color=(255, 0, 0))
+        
+        # Draw yellow info box in top-left corner showing coordinates
+        draw_box(buffer, 5, 5, 80, 12, width, height, stride, color=(0, 0, 0))  # Black background
+        
+        # Draw coordinate digits as colored boxes (simple visualization)
+        # Each "digit" is represented by a small colored square
+        x_pos = 10
+        # Show ball_x in hundreds, tens, ones
+        for digit_val in [ball_x // 100, (ball_x // 10) % 10, ball_x % 10]:
+            brightness = int(digit_val * 25.5)  # Scale 0-9 to 0-255
+            draw_box(buffer, x_pos, 7, 6, 8, width, height, stride, color=(brightness, 255, brightness))
+            x_pos += 8
+        
+        x_pos += 5  # Space
+        # Show ball_y in hundreds, tens, ones
+        for digit_val in [ball_y // 100, (ball_y // 10) % 10, ball_y % 10]:
+            brightness = int(digit_val * 25.5)
+            draw_box(buffer, x_pos, 7, 6, 8, width, height, stride, color=(255, brightness, brightness))
+            x_pos += 8
+
+    # Optional: mutate box (inverted colors)
     if args.mutate:
-        # Invert a small 60x60 box at (10,10) using buffer.extract/fill
-        bx0, by0 = 10, 10
+        bx0, by0 = width - 70, 10  # Move to top-right so it doesn't overlap
         bx1, by1 = min(width, bx0 + 60), min(height, by0 + 60)
         bpp = 3
         
         for y in range(by0, by1):
             offset = y * stride + bx0 * bpp
             row_len = (bx1 - bx0) * bpp
-            
-            # Extract the row segment
             row_data = buffer.extract_dup(offset, row_len)
-            
-            # Convert to bytearray, invert colors
             seg = bytearray(row_data)
             for i in range(0, len(seg), 3):
-                seg[i] = 255 - seg[i]       # R
-                seg[i+1] = 255 - seg[i+1]   # G
-                seg[i+2] = 255 - seg[i+2]   # B
-            
-            # Write back to buffer
+                seg[i] = 255 - seg[i]
+                seg[i+1] = 255 - seg[i+1]
+                seg[i+2] = 255 - seg[i+2]
             buffer.fill(offset, bytes(seg))
 
     if FRAME_COUNTER % 15 == 0:
-        print(f"[{FRAME_COUNTER:05d}] PTS={ms:8.2f}ms Ball:({ball_x:3d},{ball_y:3d}) brightness≈{mean_luma:6.1f} mutate={args.mutate}")
+        print(f"[{FRAME_COUNTER:05d}] PTS={ms:8.2f}ms Ball:({ball_x:3d},{ball_y:3d})")
         sys.stdout.flush()
 
 def on_bus(bus, msg, loop, pipeline):
@@ -167,13 +217,14 @@ def on_bus(bus, msg, loop, pipeline):
     return True
 
 def main():
-    ap = argparse.ArgumentParser(description="UDP sender with identity handoff - tracks ball position")
+    ap = argparse.ArgumentParser(description="UDP sender with visual ball tracking overlay")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=5000)
     ap.add_argument("--width", type=int, default=320)
     ap.add_argument("--height", type=int, default=240)
     ap.add_argument("--fps", type=int, default=30)
-    ap.add_argument("--mutate", action="store_true", help="invert a small box so edits are visible")
+    ap.add_argument("--mutate", action="store_true", help="invert a small box (top-right)")
+    ap.add_argument("--draw-position", action="store_true", help="draw crosshair + circle at ball position")
     args = ap.parse_args()
 
     pipe_desc = build_pipeline(args.host, args.port, args.width, args.height, args.fps)
@@ -184,7 +235,6 @@ def main():
         print("identity 'tap' not found", file=sys.stderr)
         sys.exit(1)
 
-    # Handle both 2-arg and 3-arg handoff signal versions
     tap.connect("handoff", lambda e, b, *extra: on_handoff(e, b, extra[0] if extra else None, args))
 
     bus = pipeline.get_bus()
@@ -192,8 +242,9 @@ def main():
     loop = GLib.MainLoop()
     bus.connect("message", on_bus, loop, pipeline)
 
-    print(f"Sending RTP/H.264 to {args.host}:{args.port} (mutate={args.mutate})")
+    print(f"Sending RTP/H.264 to {args.host}:{args.port}")
     print(f"Resolution: {args.width}x{args.height} @ {args.fps}fps")
+    print(f"Visual overlay: {args.draw_position}, Mutate box: {args.mutate}")
     print("Tracking ball position...\n")
     sys.stdout.flush()
     

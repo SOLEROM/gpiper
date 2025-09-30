@@ -9,9 +9,9 @@ ways to move data from the gstreamer pipe to python post processing
     
     ![alt text](image.png)
 
-    * see demo2:  idenity with TEE
+    * see demo2:  idenity with TEE + The overlay is "burned in" to the video before it's encoded and sent over UDP!
     ``` 
-        > python idenity_demo2_x86_send.py --port 5000 
+        > python idenity_demo2_x86_send.py --port 5000 --draw-position
         > python idenity_demo2_x86_get.py --port 5000
     ```
 
